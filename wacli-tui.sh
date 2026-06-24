@@ -18,6 +18,8 @@ CONFIG_FILE="$CONFIG_DIR/config.sh"
 e=$(printf '\e')
 R="${e}[31m"; G="${e}[32m"; Y="${e}[33m"; B="${e}[34m"; N="${e}[0m"
 BOLD="${e}[1m"; DIM="${e}[2m"
+ORANGE="${e}[38;5;214m"
+DGREEN="${e}[38;5;28m"
 
 # ── Temp files (PID-safe) ──────────────────────────────────────────────────
 FZF_ITEMS="/tmp/wacli-$$-items"
@@ -25,6 +27,17 @@ FZF_SEL="/tmp/wacli-$$-sel"
 FZF_CTRLC="/tmp/wacli-$$-ctrl-c"
 CACHE_D="/tmp/wacli-$$-cache"
 SYNC_PID_FILE="/tmp/wacli-$$-sync-pid"
+_PREVIEW_HELPER="/tmp/wacli-$$-preview-msgs"
+cat > "$_PREVIEW_HELPER" << 'PREVIEWEOF'
+#!/bin/bash
+jid="$1"
+[ -z "$jid" ] && exit
+me=$(printf '\033[38;5;28m')
+them=$(printf '\033[38;5;214m')
+rst=$(printf '\033[0m')
+wacli messages list --chat "$jid" --limit 5 --json 2>/dev/null | jq -r --arg me "$me" --arg them "$them" --arg rst "$rst" '.data.messages // .data | reverse[] | "\(if .FromMe then "\($me)Voce\($rst)" else "\($them)\(.SenderName // "?")\($rst)" end): \(.DisplayText // .MediaType // "[midia]")"' 2>/dev/null
+PREVIEWEOF
+chmod +x "$_PREVIEW_HELPER"
 
 cleanup_all() {
   sync_stop
@@ -105,7 +118,7 @@ img_preview() {
 
 # ── Logo ────────────────────────────────────────────────────────────────────
 printf -v LOGO '%s\n' \
-  "██╗    ██╗██╗  ██╗ █████╗ ████████╗███████╗ █████╗ ██████╗ ██████║ " \
+  "██╗    ██╗██╗  ██╗ █████╗ ████████╗███████╗ █████╗ ██████╗ ██████╗ " \
   "██║    ██║██║  ██║██╔══██╗╚══██╔══╝██╔════╝██╔══██╗██╔══██╗██╔══██╗" \
   "██║ █╗ ██║███████║███████║   ██║   ███████╗███████║██████╔╝██████╔╝" \
   "██║███╗██║██╔══██║██╔══██║   ██║   ╚════██║██╔══██║██╔═══╝ ██╔═══╝ " \
@@ -127,7 +140,29 @@ run_fzf() {
   fi
 }
 
+# ── text_box ────────────────────────────────────────────────────────────────
+text_box() {
+  local prompt="${1:-Texto}"
+  fzf --print-query --prompt="> " --height=1 --layout=reverse --border=rounded \
+    --border-label=" $prompt " --no-separator --info=hidden \
+    $FZF_C --color=bg:#000000,label:#87d700,prompt:#87d700 \
+    </dev/null 2>/dev/null | head -1
+}
+
 # ── Sync management ─────────────────────────────────────────────────────────
+sync_ensure() {
+  local pid
+  if [ -f "$SYNC_PID_FILE" ]; then
+    pid=$(cat "$SYNC_PID_FILE")
+    kill -0 "$pid" 2>/dev/null && return
+    rm -f "$SYNC_PID_FILE"
+  fi
+  wacli sync --follow --max-reconnect 0 >/dev/null 2>&1 &
+  pid=$!
+  echo "$pid" > "$SYNC_PID_FILE"
+  disown "$pid" 2>/dev/null || true
+}
+
 sync_start() {
   local pid
   if [ -f "$SYNC_PID_FILE" ]; then
@@ -201,9 +236,9 @@ pick_chat() {
     [[ "$d" == "null" || -z "$d" ]] && warn "Nenhum chat" && return 1
     echo "$d" | cache_set chats
   }
-  echo "$d" | jq -r '
+  echo "$d" | jq -r --arg orange "$ORANGE" --arg rst "$N" '
     sort_by(.last_message_ts // "") | reverse[]
-    | "\(.name // .jid)\(
+    | "\($orange)\(.name // .jid)\($rst)\(
         if .pinned then " 📌" else "" end
       )\(
         if .muted_until and (.muted_until > 0) then " 🔇" else "" end
@@ -213,7 +248,7 @@ pick_chat() {
         if .unread and .unread > 0 then " [" + (.unread|tostring) + "]" else "" end
       ) | \(.jid)"' > "$FZF_ITEMS"
   run_fzf --prompt="Chat > " \
-    --preview='j=$(echo {} | cut -d"|" -f2 | xargs); [ -n "$j" ] && { echo "--- Ultimas msgs ---"; wacli messages list --chat "$j" --limit 5 2>/dev/null | tail -n +2; }' \
+    --preview='j=$(echo {} | cut -d"|" -f2 | xargs); [ -n "$j" ] && { echo "--- Ultimas msgs ---"; '"$_PREVIEW_HELPER"' "$j"; }' \
     --preview-window=right:55%
   local jid; jid=$(pick_jid)
   [ -z "$jid" ] && return 1
@@ -239,13 +274,36 @@ pick_msg() {
   local d
   d=$(wdata messages list --chat "$chat" --limit 50 | jq '.messages') || return 1
   [[ "$d" == "null" || -z "$d" ]] && warn "Nenhuma msg" && return 1
-  echo "$d" | jq -r '.[] | "\(.MsgID) | \(.Timestamp | fromdateiso8601 | strflocaltime("%d/%m %H:%M:%S")) | \(.DisplayText // .MediaType // "[midia]")"' > "$FZF_ITEMS"
+  echo "$d" | jq -r --arg me "$DGREEN" --arg them "$ORANGE" --arg rst "$N" '.[] | "\(.MsgID) | \(.Timestamp | fromdateiso8601 | strflocaltime("%d/%m %H:%M:%S")) | \(if .FromMe then "\($me)Voce\($rst)" else "\($them)\(.SenderName // "?")\($rst)" end): \((.DisplayText | select(length > 0)) // .MediaType // "[midia]")"' > "$FZF_ITEMS"
   run_fzf --prompt="Mensagem > " \
     --preview='m=$(echo {} | cut -d"|" -f1 | xargs); wacli messages show --chat "'"$chat"'" --id "$m" 2>/dev/null' \
     --preview-window=right:50%
   local id; id=$(pick_id)
   [ -z "$id" ] && return 1
   echo "$id"
+}
+
+pick_file() {
+  local dir="${1:-$HOME}"
+  dir=$(realpath "$dir" 2>/dev/null || echo "$dir")
+  local sel
+
+  while true; do
+    {
+      echo "@ .."
+      ls -1p "$dir" 2>/dev/null
+    } > "$FZF_ITEMS"
+    run_fzf --prompt="Arquivo > " \
+      --header="$dir" \
+      --preview='p="'"$dir"'/{}"; [ -d "$p" ] && ls -1p "$p" | head -30 2>/dev/null || { head -50 "$p" 2>/dev/null || file -b "$p"; }' \
+      --preview-window=right:50%:wrap
+    sel=$(cat "$FZF_SEL" 2>/dev/null)
+    [ -z "$sel" ] && return 1
+    [ "$sel" = "@ .." ] && { [ "$dir" = "/" ] && return 1 || dir="$(dirname "$dir")"; continue; }
+    [ -d "$dir/$sel" ] && { dir="$dir/$sel"; continue; }
+    echo "$dir/$sel"
+    return 0
+  done
 }
 
 # ── Menu helper ─────────────────────────────────────────────────────────────
@@ -277,20 +335,20 @@ msgs() {
       "Listar msg de um chat")
         local ch; ch=$(pick_chat) || continue
         wdata messages list --chat "$ch" --limit "$WACLI_LIMIT" | \
-          jq -r '.messages[]? | "[\(.Timestamp | fromdateiso8601 | strflocaltime("%d/%m %H:%M:%S"))] \(if .FromMe then "Voce" else .SenderName // "?" end): \(.DisplayText // .MediaType // "[midia]")"' 2>/dev/null || warn "Sem msgs"
+          jq -r --arg me "$DGREEN" --arg them "$ORANGE" --arg rst "$N" '.messages[]? | "[\(.Timestamp | fromdateiso8601 | strflocaltime("%d/%m %H:%M:%S"))] \(if .FromMe then "\($me)Voce\($rst)" else "\($them)\(.SenderName // "?")\($rst)" end): \((.DisplayText | select(length > 0)) // .MediaType // "[midia]")"' 2>/dev/null || warn "Sem msgs"
         enter;;
       "Buscar")
         local q; ask "Buscar" q; [[ -z "$q" ]] && continue
         local co=""
         if conf "Filtrar chat?"; then local ct; ct=$(pick_chat) || continue; co="--chat $ct"; fi
         wdata messages search "$q" $co --limit "$WACLI_LIMIT" | \
-          jq -r '.messages[]? | "[\(.Timestamp | fromdateiso8601 | strflocaltime("%d/%m %H:%M:%S"))] [\(.ChatName)] \(.DisplayText // .MediaType // "[midia]")"' 2>/dev/null || warn "Nada"
+          jq -r --arg bld "$BOLD" --arg rst "$N" '.messages[]? | "[\(.Timestamp | fromdateiso8601 | strflocaltime("%d/%m %H:%M:%S"))] \($bld)[\(.ChatName)]\($rst) \((.DisplayText | select(length > 0)) // .MediaType // "[midia]")"' 2>/dev/null || warn "Nada"
         enter;;
       "Contexto")
         local ch; ch=$(pick_chat) || continue
         local m; m=$(pick_msg "$ch") || continue
         wdata messages context --chat "$ch" --id "$m" --before 5 --after 5 | \
-          jq -r '.[]? | "[\(.Timestamp | fromdateiso8601 | strflocaltime("%d/%m %H:%M:%S"))] \(if .FromMe then "Voce" else .SenderName end): \(.DisplayText // .MediaType // "[midia]")"' 2>/dev/null || warn "Sem contexto"
+          jq -r --arg me "$DGREEN" --arg them "$ORANGE" --arg rst "$N" '.[]? | "[\(.Timestamp | fromdateiso8601 | strflocaltime("%d/%m %H:%M:%S"))] \(if .FromMe then "\($me)Voce\($rst)" else "\($them)\(.SenderName // "?")\($rst)" end): \((.DisplayText | select(length > 0)) // .MediaType // "[midia]")"' 2>/dev/null || warn "Sem contexto"
         enter;;
       "Exportar")
         local ch; ch=$(pick_chat) || continue
@@ -300,12 +358,12 @@ msgs() {
         enter;;
       "Estreladas")
         wdata messages starred --limit 50 | \
-          jq -r '.messages[]? | "[\(.Timestamp | fromdateiso8601 | strflocaltime("%d/%m %H:%M:%S"))] [\(.ChatName)] \(.DisplayText // .MediaType // "[midia]")"' 2>/dev/null || warn "Nenhuma"
+          jq -r --arg bld "$BOLD" --arg rst "$N" '.messages[]? | "[\(.Timestamp | fromdateiso8601 | strflocaltime("%d/%m %H:%M:%S"))] \($bld)[\(.ChatName)]\($rst) \((.DisplayText | select(length > 0)) // .MediaType // "[midia]")"' 2>/dev/null || warn "Nenhuma"
         enter;;
       "Editar")
         local ch; ch=$(pick_chat) || continue
         local m; m=$(pick_msg "$ch") || continue
-        local t; ask "Novo texto" t; [[ -z "$t" ]] && continue
+        local t; t=$(text_box "Novo texto"); [[ -z "$t" ]] && continue
         wacli messages edit --chat "$ch" --id "$m" --message "$t" 2>/dev/null && ok "Editada!" || warn "Falha"
         enter;;
       "Apagar")
@@ -343,7 +401,7 @@ enviar() {
       [[ -z "$c" ]] && break
       case "$c" in
         "Texto")
-          local msg; ask "Mensagem" msg; [[ -z "$msg" ]] && continue
+          local msg; msg=$(text_box "Mensagem"); [[ -z "$msg" ]] && continue
           if conf "Responder?"; then
             local ri; ri=$(pick_msg "$to") || continue
             wacli send text --to "$to" --message "$msg" --reply-to "$ri" 2>/dev/null && ok "Enviada!" || warn "Falha"
@@ -352,12 +410,12 @@ enviar() {
           fi
           enter;;
         "Arquivo")
-          local f; ask "Caminho" f; [[ -z "$f" || ! -f "$f" ]] && die "Invalido" && enter && continue
+          local f; f=$(pick_file) || { die "Nenhum arquivo" && enter && continue; }
           local cap=""; conf "Legenda?" && ask "Legenda" cap
           wacli send file --to "$to" --file "$f" ${cap:+--caption "$cap"} 2>/dev/null && ok "Enviado!" || warn "Falha"
           enter;;
         "Figurinha")
-          local f; ask "Arquivo WebP" f; [[ -z "$f" || ! -f "$f" ]] && die "Invalido" && enter && continue
+          local f; f=$(pick_file) || { die "Nenhum arquivo" && enter && continue; }
           wacli send sticker --to "$to" --file "$f" 2>/dev/null && ok "Enviada!" || warn "Falha"
           enter;;
         "Reagir")
@@ -366,7 +424,7 @@ enviar() {
           wacli send react --to "$to" --id "$m" --reaction "$em" 2>/dev/null && ok "Reagido!" || warn "Falha"
           enter;;
         "Voz")
-          local f; ask "Arquivo OGG" f; [[ -z "$f" || ! -f "$f" ]] && die "Invalido" && enter && continue
+          local f; f=$(pick_file) || { die "Nenhum arquivo" && enter && continue; }
           wacli send voice --to "$to" --file "$f" 2>/dev/null && ok "Enviada!" || warn "Falha"
           enter;;
         "Outro contato") break;;
@@ -449,9 +507,9 @@ navegar_chats() {
     d=$(wdata chats list) || { warn "Falha ao carregar"; return; }
     [[ "$d" == "null" || -z "$d" ]] && warn "Nenhum chat" && return
 
-    echo "$d" | jq -r '
+    echo "$d" | jq -r --arg orange "$ORANGE" --arg rst "$N" '
       sort_by(.last_message_ts // "") | reverse[]
-      | "\(.name // .jid)\(
+      | "\($orange)\(.name // .jid)\($rst)\(
           if .pinned then " 📌" else "" end
         )\(
           if .muted_until and (.muted_until > 0) then " 🔇" else "" end
@@ -462,7 +520,7 @@ navegar_chats() {
         ) | \(.jid)"' > "$FZF_ITEMS"
     run_fzf --prompt="Chat > " \
       --header="ENTER=gerenciar  ESC=voltar" \
-      --preview='j=$(echo {} | cut -d"|" -f2 | xargs); [ -n "$j" ] && { echo "--- Ultimas msgs ---"; wacli messages list --chat "$j" --limit 5 2>/dev/null | tail -n +2; }' \
+      --preview='j=$(echo {} | cut -d"|" -f2 | xargs); [ -n "$j" ] && { echo "--- Ultimas msgs ---"; '"$_PREVIEW_HELPER"' "$j"; }' \
       --preview-window=right:55%
     local sel; sel=$(pick_name)
     [[ -z "$sel" ]] && return
@@ -626,19 +684,6 @@ midia() {
   done
 }
 
-presenca() {
-  while true; do
-    clear
-    menu "🎯 PRESENCA" "Digitando..." "Parou de digitar" "Voltar"
-    local c; c=$(pick_name)
-    [[ -z "$c" ]] && break
-    case "$c" in
-      "Digitando...") local to; to=$(pick_contact) || continue; wacli presence typing --to "$to" 2>/dev/null && ok "OK!" || warn "Falha"; enter;;
-      "Parou de digitar") local to; to=$(pick_contact) || continue; wacli presence paused --to "$to" 2>/dev/null && ok "OK!" || warn "Falha"; enter;;
-      "Voltar") break;;
-    esac
-  done
-}
 
 perfil() {
   while true; do
@@ -718,7 +763,7 @@ recentes() {
       end) | \(.name // .jid)"' > "$FZF_ITEMS"
   run_fzf --prompt="📋 Recentes > " \
     --header="📋 RECENTES | Enter=ver msgs  ESC=voltar" \
-    --preview='j=$(echo {} | cut -d"|" -f3 | xargs); [ -n "$j" ] && wacli messages list --chat "$j" --limit 5 2>/dev/null | tail -n +2' \
+    --preview='j=$(echo {} | cut -d"|" -f3 | xargs); [ -n "$j" ] && '"$_PREVIEW_HELPER"' "$j"' \
     --preview-window=right:55%
   local jid; jid=$(pick_field 3)
   [[ -z "$jid" ]] && return
@@ -813,7 +858,6 @@ main() {
       "  Sync" \
       "  Historico" \
       "  Midia" \
-      "  Presenca" \
       "  Perfil" \
       "  Armazenamento" \
       "  Autenticacao" \
@@ -825,9 +869,71 @@ main() {
     [[ -z "$c" ]] && continue
     case "$c" in
       *Mensagens)
+        sync_ensure
         local ch; ch=$(pick_chat) || continue
-        wdata messages list --chat "$ch" --limit "$WACLI_LIMIT" | \
-          jq -r '.messages[]? | "[\(.Timestamp | fromdateiso8601 | strflocaltime("%d/%m %H:%M:%S"))] \(if .FromMe then "Voce" else .SenderName // "?" end): \(.DisplayText // .MediaType // "[midia]")"' 2>/dev/null || warn "Sem msgs"
+        local _store_dir; _store_dir=$(wacli doctor --json 2>/dev/null | jq -r '.data.store_dir' 2>/dev/null || echo "$HOME/.wacli")
+        local _db="$_store_dir/wacli.db"
+        local _last_sent=""
+        local _chat_name; _chat_name=$(wdata chats list 2>/dev/null | jq -r --arg jid "$ch" 'map(select(.jid == $jid)) | .[0] | .name // .jid // $jid' 2>/dev/null || echo "$ch")
+        while true; do
+          clear
+          echo -e "${BOLD}${_chat_name}${N}  ${DIM}${ch}${N}"
+          echo
+          wdata messages list --chat "$ch" --limit "$WACLI_LIMIT" 2>/dev/null | jq -r \
+            --arg me "$DGREEN" --arg them "$ORANGE" --arg rst "$N" '
+            (.messages // []) | reverse[] |
+            "\(
+              if .Timestamp then
+                (.Timestamp | fromdateiso8601? // "" | strflocaltime("%d/%m/%Y %H:%M"))
+              else "" end
+            ) \(
+              if .FromMe then "\($me)Voce\($rst)" else "\($them)\(.SenderName // "?")\($rst)" end
+            ): \(
+              .DisplayText // .MediaType // "[midia]"
+            )"
+          ' 2>/dev/null
+          [ -n "$_last_sent" ] && echo -e "${G}$_last_sent${N}"
+          echo
+          local _db_mtime; _db_mtime=$(stat -c %Y "$_db" 2>/dev/null)
+          echo -e "${DIM}[Enter] texto  [f] arquivo  [v] copiar  [q] sair${N}"
+          while true; do
+            if read -rsn1 -t 1 key 2>/dev/null; then
+              case "$key" in
+                q|Q) break 2;;
+                f|F)
+                  local _ff; _ff=$(pick_file) || { warn "Nenhum" && break; }
+                  local _cap=""; conf "Legenda?" && ask "Legenda" _cap
+                  wacli send file --to "$ch" --file "$_ff" ${_cap:+--caption "$_cap"} 2>/dev/null && {
+                    _last_sent="[$(date +%H:%M)] Voce: $(basename "$_ff")"
+                    ok "Enviado!"
+                  } || warn "Falha"
+                  break;;
+                v|V)
+                  clear
+                  wacli messages list --chat "$ch" --limit 200 --json 2>/dev/null | jq -r \
+                    --arg me "$DGREEN" --arg them "$ORANGE" --arg rst "$N" '
+                    (.data.messages // .data) | reverse[] |
+                    "\($rst)[\(.Timestamp | fromdateiso8601? // "" | strflocaltime("%d/%m/%Y %H:%M"))]\($rst) \(if .FromMe then "\($me)Voce\($rst)" else "\($them)\(.SenderName // "?")\($rst)" end): \(.DisplayText // .MediaType // "[midia]")"
+                  ' 2>/dev/null | less -R
+                  break
+                  ;;
+                r|R) sync_ensure; break;;
+                $'\n'|"")
+                  local msg; msg=$(text_box "Mensagem")
+                  [[ -z "$msg" ]] && break
+                  if wacli send text --to "$ch" --message "$msg" 2>/dev/null; then
+                    _last_sent="[$(date +%H:%M)] Voce: $msg"
+                  else
+                    warn "Falha"
+                  fi
+                  break
+                  ;;
+              esac
+            fi
+            local _new_mtime; _new_mtime=$(stat -c %Y "$_db" 2>/dev/null)
+            [ "$_new_mtime" != "$_db_mtime" ] && { _db_mtime=$_new_mtime; break; }
+          done
+        done
         enter;;
       *Enviar)       enviar;;
       *Contatos)     contatos;;
@@ -838,7 +944,6 @@ main() {
       *Sync)         sync_;;
       *Historico)    hist;;
       *Midia)        midia;;
-      *Presenca)     presenca;;
       *Perfil)       perfil;;
       *Armazenamento) storage;;
       *Autenticacao) auth_;;
